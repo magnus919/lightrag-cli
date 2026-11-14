@@ -1,0 +1,145 @@
+{
+  "OllamaChatRequest": {
+    "$defs": {
+      "OllamaMessage": {
+        "properties": {
+          "role": {
+            "maxLength": 64,
+            "title": "Role",
+            "type": "string"
+          },
+          "content": {
+            "maxLength": 32768,
+            "title": "Content",
+            "type": "string"
+          },
+          "images": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 16,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Images"
+          }
+        },
+        "required": [
+          "role",
+          "content"
+        ],
+        "title": "OllamaMessage",
+        "type": "object"
+      }
+    },
+    "properties": {
+      "model": {
+        "maxLength": 256,
+        "title": "Model",
+        "type": "string"
+      },
+      "messages": {
+        "items": {
+          "$ref": "#/$defs/OllamaMessage"
+        },
+        "maxItems": 128,
+        "title": "Messages",
+        "type": "array"
+      },
+      "stream": {
+        "default": true,
+        "title": "Stream",
+        "type": "boolean"
+      },
+      "options": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Options"
+      },
+      "system": {
+        "anyOf": [
+          {
+            "maxLength": 32768,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "System"
+      }
+    },
+    "required": [
+      "model",
+      "messages"
+    ],
+    "title": "OllamaChatRequest",
+    "type": "object"
+  },
+  "OllamaGenerateRequest": {
+    "properties": {
+      "model": {
+        "maxLength": 256,
+        "title": "Model",
+        "type": "string"
+      },
+      "prompt": {
+        "maxLength": 65536,
+        "title": "Prompt",
+        "type": "string"
+      },
+      "system": {
+        "anyOf": [
+          {
+            "maxLength": 32768,
+            "type": "string"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "System"
+      },
+      "stream": {
+        "default": false,
+        "title": "Stream",
+        "type": "boolean"
+      },
+      "options": {
+        "anyOf": [
+          {
+            "additionalProperties": true,
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "default": null,
+        "title": "Options"
+      }
+    },
+    "required": [
+      "model",
+      "prompt"
+    ],
+    "title": "OllamaGenerateRequest",
+    "type": "object"
+  }
+}
