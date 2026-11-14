@@ -24,8 +24,10 @@ lightrag-cli post-documents-paginated --page 1 --page-size 20 --json
 
 Use retrieval sources/chunks as evidence, not a generated answer alone. Returned
 file paths are not necessarily public URLs. Preserve attribution and uncertainty.
-Pagination is explicit: follow document pages or source-conflict cursors until
-complete before claiming an exhaustive result. Do not treat a sampled conflict
+Use `--all` on document pagination or source-conflict listing to traverse safely.
+Check `complete:true` and exit status; bounded/failed runs return partial JSON and
+exit 1. Single-page mode remains the default. Changing collections are not a
+transactional snapshot, and conflict candidate samples remain samples. Do not treat a sampled conflict
 candidate list as complete.
 
 ## Authenticate and diagnose
