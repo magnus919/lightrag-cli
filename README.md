@@ -36,7 +36,8 @@ networks. Login happens per invocation; tokens are held in memory, not cached.
 `lightrag-cli --help` lists **45 named operations**. Command names mirror the HTTP
 method and path: `POST /graph/entity/create` becomes
 `post-graph-entity-create`. Path placeholders become named flags. Every documented
-query/body field has a flag, replacing underscores with hyphens. Nested objects
+query/body field has a flag, replacing underscores with hyphens. Help shows types,
+required/optional status, enums, server defaults and available bounds. Nested objects
 and arrays take JSON. Each command has `--help` and examples.
 
 ```sh
@@ -58,7 +59,8 @@ Use `--server-dry-run` for source-conflict repair's *server* preview flag; globa
 
 - `--json` emits machine-readable compact JSON for JSON responses. Otherwise JSON
   is pretty-printed. No status banners on stdout. Errors go to stderr.
-- Streams preserve NDJSON records and flush each record. Progress, references,
+- Streams validate NDJSON objects and flush each record. Malformed records or
+  embedded server errors exit nonzero while preserving received bytes. Progress, references,
   token output and response timing are retained. Embedded stream errors produce
   a nonzero exit after preserving partial output.
 - `--output PATH` saves exact response bytes, useful for binary assets/streams.
@@ -90,9 +92,29 @@ and image fields are accepted by those models but not used by those handlers.
 
 `operations --json` is the executable coverage manifest: commands, methods, paths,
 parameters, request schema and write guards. `schema` prints the original OpenAPI.
-Pagination remains explicit: documents use `--page` / `--page-size`, source
-conflicts use `--cursor` / `--limit`. Inspect returned continuation values; a single
-page is not an exhaustive result. There is no hidden fetch-all request loop.
+Single-page commands remain the default. Add `--all` to document pagination or
+source-conflict listing for automatic traversal. Filters, sort and page size are
+preserved; a missing document page size becomes 200. Source conflicts follow the
+opaque cursor even after short/empty pages. Authentication happens once per run.
+
+```sh
+lightrag-cli post-documents-paginated --all --json
+lightrag-cli get-documents-source-conflicts --all --max-pages 20 --max-items 1000 --json
+```
+
+Automatic results use `{items, pages_fetched, complete, duplicates_skipped, error,
+resume, snapshot_consistent}`. Identical IDs are deduplicated. Default limits are
+100 pages and 10,000 retained items; limits are explicit and bounded. A repeated
+cursor/page, malformed page, HTTP failure or exhausted safety limit produces
+partial JSON with `complete:false` **and exit 1**, never an exhaustive success.
+`--output` preserves that same envelope. Dry-run shows the plan without logging in.
+
+`resume` gives a page/cursor and within-page item offset when truncated; it is a
+hint for further inspection, not an automatically replayable snapshot token.
+Collections can change during traversal, so `snapshot_consistent` is always false:
+deduplication prevents repeats but cannot guarantee no omissions in a changing
+collection. Conflict candidate samples remain samples even when every conflict
+page has been fetched.
 
 ## Development
 

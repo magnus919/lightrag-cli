@@ -79,19 +79,103 @@ fn body_schema<'a>(s: &'a Value, o: &'a Operation) -> (&'a str, &'a Value) {
     }
     ("application/json", &Value::Null)
 }
-fn field_arg(name: &str, v: &Value) -> Arg {
+fn sample(s: &Value, v: &Value, depth: usize) -> Value {
+    let v = schema(s, v);
+    if depth > 8 {
+        return json!({});
+    }
+    if let Some(x) = v.get("default").filter(|x| !x.is_null()) {
+        return x.clone();
+    }
+    if let Some(x) = v["enum"].as_array().and_then(|a| a.first()) {
+        return x.clone();
+    }
+    if let Some(a) = v["anyOf"].as_array() {
+        return sample(
+            s,
+            a.iter().find(|b| b["type"] != "null").unwrap_or(&a[0]),
+            depth + 1,
+        );
+    }
+    match v["type"].as_str().unwrap_or("object") {
+        "string" => json!("example"),
+        "integer" | "number" => v.get("minimum").cloned().unwrap_or(json!(1)),
+        "boolean" => json!(true),
+        "array" => json!([sample(s, &v["items"], depth + 1)]),
+        _ => {
+            let mut obj = serde_json::Map::new();
+            for k in v["required"].as_array().into_iter().flatten() {
+                if let Some(k) = k.as_str() {
+                    obj.insert(k.into(), sample(s, &v["properties"][k], depth + 1));
+                }
+            }
+            Value::Object(obj)
+        }
+    }
+}
+fn example_args(s: &Value, o: &Operation) -> Vec<String> {
+    let mut a = vec![o.name.clone()];
+    for p in o.data["parameters"].as_array().into_iter().flatten() {
+        if p["required"] == true {
+            a.push(format!(
+                "--{}",
+                p["name"].as_str().unwrap().replace('_', "-")
+            ));
+            let v = sample(s, &p["schema"], 0);
+            a.push(
+                v.as_str()
+                    .map(str::to_string)
+                    .unwrap_or_else(|| v.to_string()),
+            );
+        }
+    }
+    let (ct, b) = body_schema(s, o);
+    if ct == "multipart/form-data" {
+        a.extend(["--file".into(), "./document.txt".into()]);
+    } else if o.data.get("requestBody").is_some() {
+        a.extend(["--body".into(), sample(s, b, 0).to_string()]);
+    }
+    a.extend(["--dry-run".into(), "--json".into()]);
+    a
+}
+fn field_arg(name: &str, v: &Value, required: bool) -> Arg {
+    let shape = if let Some(a) = v["anyOf"].as_array() {
+        a.iter()
+            .map(|x| x["type"].as_str().unwrap_or("object"))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    } else {
+        v["type"].as_str().unwrap_or("object").into()
+    };
+    let mut help = format!(
+        "{} [type: {}; {}]",
+        v["description"]
+            .as_str()
+            .unwrap_or("API parameter; objects/arrays use JSON"),
+        shape,
+        if required { "required" } else { "optional" }
+    );
+    for key in [
+        "enum",
+        "default",
+        "minimum",
+        "maximum",
+        "minLength",
+        "maxLength",
+        "minItems",
+        "maxItems",
+    ] {
+        if let Some(x) = v.get(key) {
+            help.push_str(&format!(" [{key}: {x}]"));
+        }
+    }
     Arg::new(name.to_string())
         .long(if name == "dry_run" {
             "server-dry-run".to_string()
         } else {
             name.replace('_', "-")
         })
-        .help(
-            v["description"]
-                .as_str()
-                .unwrap_or("API parameter; objects/arrays use JSON")
-                .to_string(),
-        )
+        .help(help)
         .num_args(1)
         .allow_hyphen_values(true)
 }
@@ -157,9 +241,33 @@ fn cli(s: &Value, ops: &[Operation]) -> Command {
         let mut c=Command::new(o.name.clone()).about(o.data["summary"].as_str().unwrap_or(&o.path).to_string()).long_about(format!("{} {}\n\n{}",o.method,o.path,o.data["description"].as_str().unwrap_or("")))
   .arg(Arg::new("body").long("body").help("Complete JSON body: literal, @file, or - for stdin"))
   .arg(Arg::new("output").long("output").help("Write exact response bytes to file (assets/streams)"))
-  .after_help(format!("Examples:\n  lightrag-cli {} --help\n  lightrag-cli {} --dry-run --json\n\nUse --body @request.json for nested/complete JSON. Omitted fields preserve server defaults.\nMutations require --yes. Stream responses are NDJSON; --output preserves raw bytes.",o.name,o.name));
+  .after_help(format!("Examples:\n  lightrag-cli {} --help\n  lightrag-cli {}\n\nThe preview example supplies required fields. Replace sample values before real requests.\nUse --body @request.json for nested/complete JSON. Omitted fields preserve server defaults.\nMutations require --yes. Stream responses are NDJSON; --output preserves raw bytes.",o.name,example_args(s,o).iter().map(|a|if a.starts_with('{') || a.contains(' ') {format!("'{}'",a.replace('\'',"'\"'\"'"))}else{a.clone()}).collect::<Vec<_>>().join(" ")));
+        if ["/documents/paginated", "/documents/source_conflicts"].contains(&o.path.as_str()) {
+            c = c
+                .arg(Arg::new("all").long("all").action(ArgAction::SetTrue).help(
+                    "Fetch successive pages safely; explicit limits; partial results exit nonzero",
+                ))
+                .arg(
+                    Arg::new("max-pages")
+                        .long("max-pages")
+                        .default_value("100")
+                        .value_parser(clap::value_parser!(u64).range(1..=10000))
+                        .help("Maximum pages with --all"),
+                )
+                .arg(
+                    Arg::new("max-items")
+                        .long("max-items")
+                        .default_value("10000")
+                        .value_parser(clap::value_parser!(u64).range(1..=1000000))
+                        .help("Maximum retained items with --all"),
+                );
+        }
         for p in o.data["parameters"].as_array().into_iter().flatten() {
-            c = c.arg(field_arg(p["name"].as_str().unwrap(), &p["schema"]));
+            c = c.arg(field_arg(
+                p["name"].as_str().unwrap(),
+                schema(s, &p["schema"]),
+                p["required"] == true,
+            ));
         }
         let (_, b) = body_schema(s, o);
         for (k, v) in b["properties"].as_object().into_iter().flatten() {
@@ -177,7 +285,13 @@ fn cli(s: &Value, ops: &[Operation]) -> Command {
             {
                 continue;
             }
-            c = c.arg(field_arg(k, v));
+            c = c.arg(field_arg(
+                k,
+                schema(s, v),
+                b["required"]
+                    .as_array()
+                    .is_some_and(|a| a.contains(&json!(k))),
+            ));
         }
         cmd = cmd.subcommand(c);
     }
@@ -387,6 +501,159 @@ fn auth(c: &Client, base: &str, m: &ArgMatches) -> Result<Option<(String, String
         .context("login response missing access_token")?;
     Ok(Some(("Authorization".into(), format!("Bearer {token}"))))
 }
+fn paginate(
+    c: &Client,
+    base: &str,
+    authentication: Option<(String, String)>,
+    r: &Request,
+    m: &ArgMatches,
+) -> Result<()> {
+    let max_pages = *m.get_one::<u64>("max-pages").unwrap();
+    let max_items = *m.get_one::<u64>("max-items").unwrap() as usize;
+    let documents = r.path == "/documents/paginated";
+    let mut page = r.body["page"].as_u64().unwrap_or(1);
+    let mut cursor = r
+        .query
+        .iter()
+        .find(|(k, _)| k == "cursor")
+        .map(|(_, v)| v.clone());
+    let mut seen_cursors = std::collections::HashSet::new();
+    let mut seen_ids = std::collections::HashSet::new();
+    let mut seen_pages = std::collections::HashSet::new();
+    let mut items = Vec::new();
+    let mut pages = 0;
+    let mut duplicates = 0;
+    let mut complete = false;
+    let mut failure = None;
+    let mut offset = 0;
+    while pages < max_pages && items.len() < max_items {
+        if let Some(cur) = &cursor
+            && !seen_cursors.insert(cur.clone())
+        {
+            failure = Some("repeated pagination cursor".to_string());
+            break;
+        }
+        let result = (|| -> Result<Value> {
+            let mut body = r.body.clone();
+            let mut query = r.query.clone();
+            if documents {
+                body["page"] = json!(page);
+                if body.get("page_size").is_none() {
+                    body["page_size"] = json!(200);
+                }
+            } else {
+                query.retain(|(k, _)| k != "cursor");
+                if let Some(cur) = &cursor {
+                    query.push(("cursor".into(), cur.clone()));
+                }
+            }
+            let mut b = c
+                .request(r.method.parse()?, format!("{base}{}", r.path))
+                .query(&query);
+            if let Some((k, v)) = &authentication {
+                b = b.header(k, v);
+            }
+            if documents {
+                b = b.json(&body);
+            }
+            let response = b.send().context("pagination transport failure")?;
+            if !response.status().is_success() {
+                bail!("pagination HTTP {}", response.status().as_u16());
+            }
+            response.json().context("invalid pagination JSON")
+        })();
+        let v = match result {
+            Ok(v) => v,
+            Err(e) => {
+                failure = Some(e.to_string());
+                break;
+            }
+        };
+        pages += 1;
+        let key = if documents { "documents" } else { "conflicts" };
+        let Some(batch) = v[key].as_array() else {
+            failure = Some("pagination response missing item array".into());
+            break;
+        };
+        if !batch.is_empty() && !seen_pages.insert(serde_json::to_string(batch)?) {
+            failure = Some("repeated pagination page".into());
+            break;
+        }
+        let mut truncated = false;
+        for (i, item) in batch.iter().enumerate() {
+            let id = item[if documents {
+                "id"
+            } else {
+                "canonical_source_key"
+            }]
+            .as_str();
+            if id.is_some_and(|id| !seen_ids.insert(id.to_string())) {
+                duplicates += 1;
+                continue;
+            }
+            if items.len() == max_items {
+                offset = i;
+                truncated = true;
+                break;
+            }
+            items.push(item.clone());
+        }
+        if truncated {
+            failure = Some("item limit reached".into());
+            break;
+        }
+        if documents {
+            let Some(has_next) = v["pagination"]["has_next"].as_bool() else {
+                failure = Some("pagination response missing has_next".into());
+                break;
+            };
+            if v["pagination"]["page"].as_u64() != Some(page) {
+                failure = Some("server returned unexpected page number".into());
+                break;
+            }
+            if has_next && batch.is_empty() {
+                failure = Some("empty document page claims continuation".into());
+                break;
+            }
+            if !has_next {
+                complete = true;
+                break;
+            }
+            page += 1;
+        } else {
+            match v.get("next_cursor") {
+                Some(Value::Null) => {
+                    complete = true;
+                    break;
+                }
+                Some(Value::String(next)) if !next.is_empty() => cursor = Some(next.clone()),
+                _ => {
+                    failure = Some("pagination response missing valid next_cursor".into());
+                    break;
+                }
+            }
+        }
+    }
+    if !complete && failure.is_none() {
+        failure = Some("pagination safety limit reached".into());
+    }
+    let result = json!({"items":items,"pages_fetched":pages,"complete":complete,"duplicates_skipped":duplicates,"error":failure,"resume":if complete{Value::Null}else if documents{json!({"page":page,"item_offset":offset})}else{json!({"cursor":cursor,"item_offset":offset})},"snapshot_consistent":false});
+    let bytes = if m.get_flag("json") {
+        serde_json::to_vec(&result)?
+    } else {
+        serde_json::to_vec_pretty(&result)?
+    };
+    if let Some(path) = m.get_one::<String>("output") {
+        fs::write(path, bytes)?;
+    } else {
+        io::stdout().write_all(&bytes)?;
+        println!();
+    }
+    if !complete {
+        bail!("pagination incomplete; partial results and continuation preserved");
+    }
+    Ok(())
+}
 fn run() -> Result<()> {
     let s = load_spec();
     let ops = operations(&s);
@@ -406,7 +673,7 @@ fn run() -> Result<()> {
     if matches.get_flag("dry-run") {
         println!(
             "{}",
-            json!({"dry_run":true,"method":r.method,"path":r.path,"query":r.query,"body":if o.path=="/login"{json!("[redacted]")}else{r.body.clone()},"files":r.files,"content_type":r.content_type,"requires_yes":!is_read(o)})
+            json!({"dry_run":true,"method":r.method,"path":r.path,"query":r.query,"body":if o.path=="/login"{json!("[redacted]")}else{r.body.clone()},"files":r.files,"content_type":r.content_type,"requires_yes":!is_read(o),"automatic_pagination":m.try_get_one::<bool>("all").ok().flatten().copied().unwrap_or(false),"pagination_limits":{"max_pages":m.try_get_one::<u64>("max-pages").ok().flatten(),"max_items":m.try_get_one::<u64>("max-items").ok().flatten()}})
         );
         return Ok(());
     }
@@ -427,6 +694,14 @@ fn run() -> Result<()> {
         bail!("base URL must be http(s), without credentials, query or fragment");
     }
     let c = client(*matches.get_one::<u64>("timeout").unwrap())?;
+    if m.try_get_one::<bool>("all")
+        .ok()
+        .flatten()
+        .copied()
+        .unwrap_or(false)
+    {
+        return paginate(&c, base, auth(&c, base, &matches)?, &r, m);
+    }
     let mut b = c
         .request(r.method.parse()?, format!("{base}{}", r.path))
         .query(&r.query);
@@ -438,6 +713,9 @@ fn run() -> Result<()> {
     if r.content_type == "multipart/form-data" {
         let mut form = multipart::Form::new();
         for (k, v) in r.body.as_object().context("body must be object")? {
+            if r.files.contains_key(k) {
+                continue;
+            }
             form = form.text(
                 k.clone(),
                 v.as_str()
@@ -514,17 +792,22 @@ fn run() -> Result<()> {
         let mut line = Vec::new();
         let mut failed = false;
         while reader.read_until(b'\n', &mut line)? != 0 {
-            if let Ok(v) = serde_json::from_slice::<Value>(&line)
-                && v.get("error").is_some_and(|e| !e.is_null())
-            {
-                failed = true;
+            if !line.iter().all(u8::is_ascii_whitespace) {
+                match serde_json::from_slice::<Value>(&line) {
+                    Ok(v) if v.is_object() => {
+                        if v.get("error").is_some_and(|e| !e.is_null()) {
+                            failed = true;
+                        }
+                    }
+                    _ => failed = true,
+                }
             }
             out.write_all(&line)?;
             out.flush()?;
             line.clear();
         }
         if failed {
-            bail!("server reported an error within stream; partial output preserved");
+            bail!("invalid NDJSON or server error within stream; partial output preserved");
         }
     } else if let Some(p) = m.get_one::<String>("output") {
         let mut file = fs::File::create(p)?;
@@ -550,6 +833,18 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn every_preview_example_is_valid() {
+        let s = load_spec();
+        let ops = operations(&s);
+        for o in &ops {
+            let mut args = vec!["lightrag-cli".to_string()];
+            args.extend(example_args(&s, o));
+            let m = cli(&s, &ops).try_get_matches_from(args).unwrap();
+            request(&s, o, m.subcommand().unwrap().1)
+                .unwrap_or_else(|e| panic!("{}: {}", o.name, e));
+        }
+    }
     #[test]
     fn all_commands_build() {
         let s = load_spec();

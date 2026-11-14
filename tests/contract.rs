@@ -321,3 +321,228 @@ fn output_stream_errors_still_fail() {
     assert!(o.stdout.is_empty());
     assert!(std::fs::read_to_string(path).unwrap().contains("error"));
 }
+
+fn mocked_responses(
+    responses: Vec<(u16, serde_json::Value)>,
+    args: Vec<String>,
+) -> (std::process::Output, Vec<String>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let h = thread::spawn(move || {
+        let mut requests = vec![];
+        for (status, body) in responses {
+            let (mut stream, _) = listener.accept().unwrap();
+            requests.push(read_request(&mut stream));
+            let body = body.to_string();
+            write!(stream,"HTTP/1.1 {status} Test\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len()).unwrap();
+        }
+        requests
+    });
+    let mut a = vec!["--url".to_string(), url];
+    a.extend(args);
+    let refs = a.iter().map(String::as_str).collect::<Vec<_>>();
+    let o = cli(&refs);
+    (o, h.join().unwrap())
+}
+#[test]
+fn automatic_document_pages_preserve_filters() {
+    let (a, requests) = mocked_responses(
+        vec![
+            (
+                200,
+                serde_json::json!({"documents":[{"id":"one"}],"pagination":{"page":1,"has_next":true}}),
+            ),
+            (
+                200,
+                serde_json::json!({"documents":[{"id":"one"},{"id":"two"}],"pagination":{"page":2,"has_next":false}}),
+            ),
+        ],
+        [
+            "post-documents-paginated",
+            "--all",
+            "--status-filter",
+            "processed",
+            "--page-size",
+            "10",
+            "--json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    );
+    assert!(a.status.success(), "{}", String::from_utf8_lossy(&a.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&a.stdout).unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 2);
+    assert_eq!(v["duplicates_skipped"], 1);
+    assert_eq!(v["complete"], true);
+    for r in requests {
+        assert!(r.contains("\"status_filter\":\"processed\""));
+        assert!(r.contains("\"page_size\":10"));
+    }
+}
+#[test]
+fn cursor_pagination_empty_page_and_loop_guard() {
+    let (a, r) = mocked_responses(
+        vec![
+            (200, serde_json::json!({"conflicts":[],"next_cursor":"a?x"})),
+            (
+                200,
+                serde_json::json!({"conflicts":[{"canonical_source_key":"key"}],"next_cursor":null}),
+            ),
+        ],
+        [
+            "get-documents-source-conflicts",
+            "--all",
+            "--limit",
+            "2",
+            "--json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    );
+    assert!(a.status.success());
+    assert!(r[1].contains("cursor=a%3Fx"));
+    let (a, _) = mocked_responses(
+        vec![
+            (
+                200,
+                serde_json::json!({"conflicts":[],"next_cursor":"same"}),
+            ),
+            (
+                200,
+                serde_json::json!({"conflicts":[],"next_cursor":"same"}),
+            ),
+        ],
+        ["get-documents-source-conflicts", "--all", "--json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    assert!(!a.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&a.stdout).unwrap();
+    assert_eq!(v["complete"], false);
+    assert!(v["error"].as_str().unwrap().contains("repeated"));
+}
+#[test]
+fn page_failure_and_limits_preserve_partial() {
+    for limit in [false, true] {
+        let mut responses = vec![(
+            200,
+            serde_json::json!({"documents":[{"id":"one"}],"pagination":{"page":1,"has_next":true}}),
+        )];
+        if !limit {
+            responses.push((500, serde_json::json!({"error":"server"})));
+        }
+        let mut args = vec![
+            "post-documents-paginated".to_string(),
+            "--all".into(),
+            "--json".into(),
+        ];
+        if limit {
+            args.extend(["--max-pages".into(), "1".into()]);
+        }
+        let (o, _) = mocked_responses(responses, args);
+        assert!(!o.status.success());
+        let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+        assert_eq!(v["complete"], false);
+        assert_eq!(v["items"].as_array().unwrap().len(), 1);
+        assert_eq!(v["resume"]["page"], 2);
+    }
+}
+#[test]
+fn offline_all_and_help_metadata() {
+    let o = cli(&["post-documents-paginated", "--all", "--dry-run"]);
+    assert!(o.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["automatic_pagination"], true);
+    let o = cli(&["post-query", "--help"]);
+    let h = String::from_utf8_lossy(&o.stdout);
+    assert!(h.contains("enum:"));
+    assert!(h.contains("default:"));
+    assert!(h.contains("required"));
+}
+#[test]
+fn malformed_stream_fails() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let h = thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        read_request(&mut s);
+        let b = "{broken-json}\n";
+        write!(s,"HTTP/1.1 200 OK\r\nContent-Type: application/x-ndjson\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{b}",b.len()).unwrap();
+    });
+    let o = cli(&["--url", &url, "post-query-stream", "--query", "hello"]);
+    h.join().unwrap();
+    assert!(!o.status.success());
+    assert_eq!(o.stdout, b"{broken-json}\n");
+}
+#[test]
+fn multipart_flag_overrides_body() {
+    let dir = tempfile::tempdir().unwrap();
+    let file = dir.path().join("new.txt");
+    std::fs::write(&file, "new-content").unwrap();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    let h = thread::spawn(move || {
+        let (mut s, _) = listener.accept().unwrap();
+        let req = read_request(&mut s);
+        assert_eq!(req.matches("name=\"file\"").count(), 1);
+        assert!(!req.contains("old-path"));
+        write!(s,"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{{}}").unwrap();
+    });
+    let o = cli(&[
+        "--url",
+        &url,
+        "post-documents-upload",
+        "--body",
+        r#"{"file":"old-path"}"#,
+        "--file",
+        file.to_str().unwrap(),
+        "--yes",
+    ]);
+    h.join().unwrap();
+    assert!(o.status.success());
+}
+#[test]
+fn item_cap_and_repeated_document_page() {
+    let (a, _) = mocked_responses(
+        vec![(
+            200,
+            serde_json::json!({"documents":[{"id":"one"},{"id":"two"}],"pagination":{"page":1,"has_next":false}}),
+        )],
+        [
+            "post-documents-paginated",
+            "--all",
+            "--max-items",
+            "1",
+            "--json",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect(),
+    );
+    assert!(!a.status.success());
+    let v: serde_json::Value = serde_json::from_slice(&a.stdout).unwrap();
+    assert_eq!(v["items"].as_array().unwrap().len(), 1);
+    assert_eq!(v["resume"]["page"], 1);
+    assert_eq!(v["resume"]["item_offset"], 1);
+    let (a, _) = mocked_responses(
+        vec![
+            (
+                200,
+                serde_json::json!({"documents":[{"id":"one"}],"pagination":{"page":1,"has_next":true}}),
+            ),
+            (
+                200,
+                serde_json::json!({"documents":[{"id":"one"}],"pagination":{"page":2,"has_next":true}}),
+            ),
+        ],
+        ["post-documents-paginated", "--all", "--json"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
+    );
+    assert!(!a.status.success());
+    assert!(String::from_utf8_lossy(&a.stdout).contains("repeated pagination page"));
+}
